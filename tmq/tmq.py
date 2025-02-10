@@ -60,6 +60,14 @@ class TensorType(Enum):
     COMPRESSED_TERNARY_32BIT = 3        # Compressed 2-bit ternary bit-stuffed in a 32-bit word (16 elements per word)
 
 
+class QuantizationScheduleBuilder:
+
+    @staticmethod
+    def default_schedule(max_epochs : int):
+        assert max_epochs >= 50, "Need at least 50 epochs for a default schedule"
+        return int(max_epochs * 0.3), int(max_epochs * 0.8), int(max_epochs * 0.875), int(max_epochs * 0.93), max_epochs
+
+
 class QuantizationControl:
     """
 
@@ -150,7 +158,7 @@ class QuantizationControl:
 
         # HACK (mw) Crude heuristic here, make this more flexible and maybe us a learning rate scheduler class type instead
 
-        # If we are past all modulations, set everything to the max values and return
+        # If we are past all cycling, set everything to the max values and return
         if epoch >= self.epoch_knots[3]:
             self.qpenalty = self.qpenalty_range[1]
             self.digamma = self.digamma_end
@@ -560,6 +568,12 @@ class Linear(nn.Module, TMQLayer):
 
 
 class Conv2d(nn.Module, TMQLayer):
+    """
+    In-training quantization version of a 2D convolution layer
+
+    This layer can be used as a drop-in replacement for PyTorch's standard Conv2d layer. It provides the same
+    interface as the original and extends it by a few functions that handle the quantization part.
+    """
 
     def __init__(self, in_channels, out_channels, kernel, stride=1, padding=0, groups=1, dilation=1,
                  bias=True, device=None, ctrl=None, quant_mode=QuantMode.NONE, post_scale=False):

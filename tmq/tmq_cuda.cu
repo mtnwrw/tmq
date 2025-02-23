@@ -27,10 +27,12 @@ static bool FP16_WARNING_ISSUED=false;
 static bool CONSTANT_MEMORY_INITIALIZED=false;
 static std::mutex CONSTANT_MEMORY_LOCK;
 
+// TODO (mw) maybe pass this in via __grid__constant__ params
 __constant__ float ternaryPatterns[256*4];     // 4k constant memory, usual constant cache is 8k per SM
 
 //------------------------------------- CUDA/Device Functions --------------------------------------
 
+// TODO (mw) docs
 __host__
 inline static float sigmoid(float x) {
     float y = max(-3.0f, min(3.0f, x));
@@ -39,6 +41,7 @@ inline static float sigmoid(float x) {
 }
 
 
+// TODO (mw) docs
 template<typename T>
 __global__
 void forwardSoftStepDerivativeKernelFP(const T * weights, T * output, float digamma, float delta, float scale, size_t size) {
@@ -56,6 +59,7 @@ void forwardSoftStepDerivativeKernelFP(const T * weights, T * output, float diga
 }
 
 
+// TODO (mw) docs
 template<typename T, typename D>
 __global__
 void backwardSoftStepDerivativeKernelFP(const T * weights, const T * grad, D * output, float digamma, float delta, float scale, size_t size) {
@@ -110,6 +114,7 @@ void backwardSoftStepKernelFP(const T * weights, const T * grad, D * output, flo
 // format of input tensor: (batch) x (pixels) x (channels)
 // format of output tensor: (batch) x (channel) x (kernel) x (pixels)
 // threads: BH * 1
+// TODO (mw) docs
 template<int BH, int BW, int NT>
 __global__ void ternaryDWConvTransFP32(const float * inputTensor, float *outputTensor, const uint32_t * coeffs, int patches, int channels, int kernelSize) {
     constexpr static int BWM = BW+1;
@@ -469,7 +474,7 @@ static void constantInit() {
 }
 
 
-
+// TODO (mw) docs
 torch::Tensor ternaryMMultCUDA(torch::Tensor lhs, torch::Tensor weights, int columns) {
     constexpr int BS = 64;
     TORCH_CHECK(lhs.device().type() == torch::kCUDA);
@@ -553,8 +558,8 @@ torch::Tensor ternaryMMultCUDA(torch::Tensor lhs, torch::Tensor weights, int col
  *
  * @return
  *
- * TODO
  */
+// TODO (mw) docs
 torch::Tensor ternaryMVMultCUDA(torch::Tensor vector, torch::Tensor weights, int columns) {
     constexpr int BS = 16;
     constexpr int COEFFPACK = 16;
@@ -598,6 +603,7 @@ torch::Tensor ternaryMVMultCUDA(torch::Tensor vector, torch::Tensor weights, int
 }
 
 
+// TODO (mw) docs
 torch::Tensor ternaryDWConvCUDA(torch::Tensor input, torch::Tensor weights, int kx, int ky, int channels) {
     constexpr int BW = 16;
     constexpr int BH = 128;
@@ -680,6 +686,7 @@ torch::Tensor ternaryDWConvTransCUDA(torch::Tensor input, torch::Tensor weights,
 }
 
 
+// TODO (mw) docs
 torch::Tensor forwardSoftStepDerivativeCUDA(torch::Tensor weights, float digamma, float strength) {
     TORCH_CHECK(weights.device().type() == torch::kCUDA);
     auto options = torch::TensorOptions().device(weights.device()).dtype(weights.dtype());
@@ -702,6 +709,7 @@ torch::Tensor forwardSoftStepDerivativeCUDA(torch::Tensor weights, float digamma
 }
 
 
+// TODO (mw) docs
 torch::Tensor backwardSoftStepDerivativeCUDA(torch::Tensor weights, float digamma, float scale, torch::Tensor grad) {
     TORCH_CHECK(weights.device().type() == torch::kCUDA);
     TORCH_CHECK(grad.device().type() == torch::kCUDA);
@@ -728,6 +736,7 @@ torch::Tensor backwardSoftStepDerivativeCUDA(torch::Tensor weights, float digamm
 
 
 
+// TODO (mw) docs
 torch::Tensor forwardSoftStepCUDA(torch::Tensor weights, float digamma) {
     TORCH_CHECK(weights.device().type() == torch::kCUDA);
     auto options = torch::TensorOptions().device(weights.device()).dtype(weights.dtype());
@@ -754,6 +763,8 @@ torch::Tensor forwardSoftStepCUDA(torch::Tensor weights, float digamma) {
     return output;
 }
 
+
+// TODO (mw) docs
 torch::Tensor backwardSoftStepCUDA(torch::Tensor weights, float digamma, float scale, torch::Tensor grad) {
     TORCH_CHECK(weights.device().type() == torch::kCUDA);
     TORCH_CHECK(grad.device().type() == torch::kCUDA);

@@ -114,21 +114,29 @@ def train_single_epoch(model, ctrl, optim, loader, epoch, device, class_weights=
     :return: Tuple of (averaged) losses incurred during training batch
     """
     model.train()
-    if ctrl is not None:
-        ctrl.clamp()
     avgloss, avgqloss, top1_acc, top3_acc = 0, 0, 0, 0
     for batch_idx, item in enumerate(tqdm(loader)):
         optim.zero_grad()
         pred = model(item[0].to(device))
         loss = F.cross_entropy(pred, item[1].to(device), weight=class_weights)
+        # ---------------------------------------------------------------------------
+        # If we do have a quantization loss set in the controller, add it to the loss
+        # here, this part is TMQ-specific and has to be added to existing code
+        # ---------------------------------------------------------------------------
         if ctrl is not None:
             qloss = ctrl.quantization_loss()
             loss += qloss
         else:
             qloss = None
 
+        # ---------------------------------------------------------------------------
+        # Standard backprop, followed by clamping of the weights, the latter is
+        # TMQ-specific and has to be added to existing code
+        # ---------------------------------------------------------------------------
         loss.backward()
         optim.step()
+
+        # TMQ-specific clamping
         if ctrl is not None:
             ctrl.clamp()
 
@@ -184,8 +192,6 @@ def training_loop(model, optim, scheduler, loaders, start_epoch, max_epoch, qctr
     """
     Training loop that runs a complete batch of training data followed by a complete batch of test data
 
-
-
     :param model: Model to be trained
     :param optim: Optimizer to be used for training
     :param scheduler: Optional learning rate scheduler (None if no LR scheduling is desired)
@@ -207,11 +213,15 @@ def training_loop(model, optim, scheduler, loaders, start_epoch, max_epoch, qctr
     # Epoch loop
     for epoch in range(start_epoch, max_epoch):
 
-        # Step the quantization controller
+        # --------------------------------------------------------------------------------------------------------------
+        # Step the quantization controller, this part is TMQ-specific and has to be added to existing code.
+        # --------------------------------------------------------------------------------------------------------------
         if qctrl is not None:
             qctrl.step(epoch)
 
-        # Run training batches
+        # --------------------------------------------------------------------------------------------------------------
+        # Run training batches, standard training loop behaviour
+        # --------------------------------------------------------------------------------------------------------------
         trainloss, qloss, ttop1, ttop3 = train_single_epoch(model, qctrl, optim, loaders[0], epoch, device, class_weights)
 
         # Run validation batches
@@ -221,23 +231,31 @@ def training_loop(model, optim, scheduler, loaders, start_epoch, max_epoch, qctr
         if enable_wandb:
             log_epoch(model, optim, scheduler, trainloss, loss, ttop1, ttop3, top1, top3, qctrl, qloss, epoch)
 
+        # --------------------------------------------------------------------------------------------------------------
         # Though it only partially makes sense, we do keep track of a "best" model. Normally we would use
         # the state of the last epoch since this is quantized to the maximum extent
+        # --------------------------------------------------------------------------------------------------------------
         if bestloss is None or loss < bestloss:
             torch.save({'optimizer': optim.state_dict(), 'model': model.state_dict(), 'epoch': epoch},
                        f"checkpoints/best_{run}.pt")
             bestloss = loss
 
-        # Store the epoch checkpoint. In regard to the desired outcome (a fully quantized model), those checkpoints
-        # are the ones to be used over the checkpoints with the best test loss/accuracy
+        # --------------------------------------------------------------------------------------------------------------
+        # Store the "last" epoch checkpoint. In regard to the desired outcome (a fully quantized model), those checkpoints
+        # are the ones to be used over the checkpoints with the best test loss/accuracy as those may not have a good
+        # level of quantization (full quantization usually degrades model performance)
+        # --------------------------------------------------------------------------------------------------------------
         torch.save({'optimizer':optim.state_dict(), 'model': model.state_dict(), 'epoch': epoch}, f"checkpoints/checkpoint_{run}.pt")
 
         # If we use a learning rate scheduler, step it
         if scheduler is not None:
             scheduler.step()
 
-    # After training is done, we force the model to be fully quantized and run another epoch (this does not run on a ternary
-    # representation but is numerically equivalent to it)
+    # ------------------------------------------------------------------------------------------------------------------
+    # After training is done, we force the model to be fully quantized and run another epoch (this does not run on a
+    # ternary representation but is numerically equivalent to it). This part is TMQ-specific and has to be added to
+    # existing code...
+    # ------------------------------------------------------------------------------------------------------------------
     if qctrl is not None:
         qctrl.quantize()
         if enable_wandb:
@@ -264,7 +282,7 @@ if __name__ == "__main__":
     parser.add_argument('--qpen', type=float, default=0.0005, help="Quantization penalty target value, defaults to 0.0005")
     parser.add_argument('--wbkey', type=str, help="Authentication key for W&B")
     parser.add_argument('--digamma', type=float, default=6, help="Final digamma (stepiness) value for in-training quantization, should not exceed 20, sensible values are around 6-10")
-    parser.add_argument("--disablebn", default=False, action="store_true", dest="disablebn", help="By default we append a 1D batchnorm to the final FC layer, this flag disabled it")
+    parser.add_argument("--disablebn", default=False, action="store_true", dest="disablebn", help="By default we append a 1D batchnorm to the final FC layer, this flag disables it")
     parser.add_argument("--download", default=False, action="store_true", dest="download", help="Download sample data if not on system")
     args = parser.parse_args()
 
@@ -284,9 +302,9 @@ if __name__ == "__main__":
     if not os.path.exists("checkpoints"):
         os.makedirs("checkpoints")
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     # Initialize Weights & Biases for logging (if enabled)
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     if args.wandb is not None and len(args.wandb) > 0:
         try:
             import wandb
@@ -296,9 +314,9 @@ if __name__ == "__main__":
     else:
         use_wandb = False
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     # Establish datasets...
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     transforms = transforms.Compose([transforms.Resize([224, 224]), transforms.Lambda(lambda x: x.convert('RGB')), transforms.ToTensor(),
                                      transforms.Normalize([0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
@@ -320,15 +338,17 @@ if __name__ == "__main__":
     print("%d items in complete dataset" % len(rootdata))
     print("%d items in training set, %d items in validation set" % (len(train), len(val)))
 
+    # -----------------------------------------------------------------------------
+    # Create standard ResNet-18 model..
+    # -----------------------------------------------------------------------------
+    model = resnet18(num_classes=num_classes)
 
-    # ---------------------------------------------------------
-    # Create and quantize model, optimizer and optional learning
-    # rate scheduler, load state dict if in resume mode...
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
+    # Quantize model, this part is TMQ-specific and has to be
+    # added to existing non-quantized code-bases
+    # -----------------------------------------------------------------------------
     schedule = QuantizationScheduleBuilder. default_schedule(args.max_epochs)
     ctrl = QuantizationControl(schedule, digamma_range=(0.1, args.digamma), qpenalty_range=(args.qpenbase, args.qpen), post_scale=args.scale, device=args.device) if not args.float else None
-
-    model = resnet18(num_classes=num_classes)
 
     if ctrl is not None:
         quantize_model(model, ctrl)                 # Performs an in-place quantization of the model
@@ -337,6 +357,9 @@ if __name__ == "__main__":
             model.fc.disable_bias()
             model.fc.implicit_bn()
 
+    # -----------------------------------------------------------------------------
+    # Create optimizer and optional learning rate scheduler
+    # -----------------------------------------------------------------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if args.float:
         # Use a learning rate scheduler for 32-bit FP reference computations
@@ -345,6 +368,10 @@ if __name__ == "__main__":
         lrscheduler = None
 
     start_epoch = 1
+
+    # -----------------------------------------------------------------------------
+    # If we are supplied with a checkpoint, restore it here...
+    # -----------------------------------------------------------------------------
     if args.resume is not None:
         if len(args.resume) > 0:
             cp = torch.load(args.resume, map_location=args.device)
@@ -356,17 +383,17 @@ if __name__ == "__main__":
             print("Checkpoint required")
             sys.exit(1)
 
-    model = model.to(args.device)
+    model = model.to(args.device)               # Move the model to something fast
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     # Create data loaders
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     train_loader = DataLoader(train, batch_size=args.batch_size, drop_last=True, num_workers=4, shuffle=True)
     val_loader = DataLoader(val, batch_size=args.batch_size, drop_last=True, num_workers=4, shuffle=True)
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
     # Run training loop
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------------
 
     training_loop(model, optimizer, lrscheduler, (train_loader, val_loader), start_epoch, args.max_epochs,
                   ctrl, run, use_wandb, device=args.device, class_weights=None)

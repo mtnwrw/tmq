@@ -14,8 +14,8 @@ Currently supported are:
   - ConvTranspose2d
   - Linear
   
-This file also features a control class that keeps track of all quantizing instances as well as providing
-global parameters to the quantizing operations in order to control the training process.  
+This file also features a control class that keeps track of all quantization-aware instances as well as providing
+global parameters to the quantization operations in order to control the training process.  
 """
 
 import torch
@@ -25,6 +25,7 @@ import fnmatch
 from enum import Enum
 import math
 
+# Import CUDA helpers if compiled
 try:
     from tmq_cuda import fwd_softstep, bwd_softstep, ternary_mmm_cuda, ternary_mvm_cuda, \
                          ternary_dwconv_cuda,  ternary_dwconvtrans_cuda, \
@@ -33,14 +34,22 @@ try:
 except ImportError:
     CUDA_EXT_AVAILABLE = False
 
+# Import native code helpers (for compression) if compiled
 try:
     from tmq_native import compactify_ternary, compress_ternary, decompress_ternary, expand_ternary
     NATIVE_EXT_AVAILABLE = True
 except ImportError:
+    # NOTE (mw) when native helpers are not available, we cannot compress or decompress the data
     NATIVE_EXT_AVAILABLE = False
 
 
 class QuantMode(Enum):
+    """
+    Enumerator for quantization modes
+
+    As of now this code-base is only tested with ternary quantization. It is not clear if the other modes will
+    ever be implemented.
+    """
     NONE = 0                            # No quantization
     TERNARY = 1                         # Ternary quantization {-1,0,1}
     TWO_BIT = 2                         # 2-bit quantization {-2,..,1}
@@ -61,7 +70,9 @@ class TensorType(Enum):
 
 
 class QuantizationScheduleBuilder:
-
+    """
+    Simple builder for quantization schedules, rather incomplete as of now and requires more work
+    """
     @staticmethod
     def default_schedule(max_epochs : int):
         assert max_epochs >= 50, "Need at least 50 epochs for a default schedule"
@@ -70,6 +81,15 @@ class QuantizationScheduleBuilder:
 
 class QuantizationControl:
     """
+    Main controller instance for quantization-aware training
+
+    This serves as controlling unit for all quantization-aware layers in a model. All instances of TMQLayer are
+    registered in the controller (and also have stored associations to the controller themselves) in order to read
+    parameters and invoke callbacks in different circumstances. Even for inference, a controller instance is required
+    to orchestrate things.
+
+    This class was initially born as a hack, but it proved itself useful, so we keep it for now.
+
 
 
     The epoch_knots parameter is used for modulating the digamma schedule as well as the quantization loss schedule
@@ -80,6 +100,7 @@ class QuantizationControl:
       - index 3: Number of epochs to stop cycling the digamma value
       - index 4: Number of total epochs for training
     """
+
     def __init__(self, epoch_knots=None, digamma_range=(0.1, 6), qpenalty_range=None, quant_mode=QuantMode.TERNARY, post_scale=False, init_range=None, device="cpu"):
         # TODO (mw) check if we can get rid of the device
         assert epoch_knots is None or len(epoch_knots) == 5
@@ -99,21 +120,22 @@ class QuantizationControl:
             self.max_epochs = 0
 
         # Misc member variable initializations
-        self.quantization = quant_mode
-        self.epoch_knots = epoch_knots
-        self.post_scale = post_scale
-        self.digamma_start = max(0.05, digamma_range[0])
-        self.digamma_end = max(3, digamma_range[1])
-        self.digamma = self.digamma_start
+        self.quantization = quant_mode                          # Quantization mode to use
+        self.epoch_knots = epoch_knots                          # Control vector for the training schedule
+        self.post_scale = post_scale                            # Apply fixed post-scaling on each TMQLayer instance (always prefer batchnorm before doing this)
+        self.digamma_start = max(0.05, digamma_range[0])        # Starting value for quantization-softness (avoid 0 here, 0.05 is basically no quantization)
+        self.digamma_end = max(3, digamma_range[1])             # Final value for quantization softness (never go below 3 which is still quite soft)
+        self.digamma = self.digamma_start                       # Current value for the schedule that provides the quantization softness (or hardness, depending on what perspective)
         self.qpenalty = qpenalty_range[0] if qpenalty_range is not None else 0
         self.qpenalty_sharpness = 5.0                           # TODO (mw) make this configurable ?
-        self.inference_mode = False
-        self.device = device
-        self._registry = {}
+        self.inference_mode = self.max_epochs == 0              # Switch to inference mode if no schedule is done, otherwise assume we are running in training
+        self.device = device                                    # Device that the TMQLayer instances are running on
+
+        self._registry = {}                                     # Registry for _all_ TMQLayer instances in the model (must be complete)
         self._last_cycle = -1
         self._digamma_cycle_start = 0
         self._digamma_cycle_end = 0
-        self._cycle_len = 15
+        self._cycle_len = 15                                    # HACK (mw) this is based on only a few experiments
 
         # Set clamping values and parameter initialization range based on number of quantization leve
         if quant_mode == QuantMode.TERNARY:
@@ -133,6 +155,17 @@ class QuantizationControl:
 
 
     def step(self, epoch):
+        """
+        Quantization schedule stepping/epoch function which adjusts quantization parameters per epoch
+
+        Use this function before every epoch of training to advance the quantization parameters according to the provided
+        schedule.
+        """
+
+        # ---------------------------------------------------
+        # Some internal helpers functions, skip down 20 lines
+        # to look at the actual implementation
+        # ---------------------------------------------------
         def _lerp(alpha0, alpha1, alpha, source, target):
             weight = min(1, max(0, (alpha-alpha0) / (alpha1-alpha0)))
             return weight * target + (1-weight) * source
@@ -153,8 +186,17 @@ class QuantizationControl:
             e1 = self.epoch_knots[knot]
             return _lerp(e0, e1, epoch, src, tgt)
 
+        # -------------------------------------------------
+        # If we have no schedule, we cannot step
+        # -------------------------------------------------
         if self.epoch_knots is None:
             return
+
+        # -------------------------------------------------
+        # Code that controls the schedules for digamma
+        # (quantization sharpness), cycling and quantization
+        # penalty...
+        # -------------------------------------------------
 
         # HACK (mw) Crude heuristic here, make this more flexible and maybe us a learning rate scheduler class type instead
 
@@ -196,6 +238,11 @@ class QuantizationControl:
 
 
     def inference(self):
+        """
+        Run all TMQLayers in inference mode only
+
+        This just sets a flag which is checked by all TMQLayer instances inside the registry
+        """
         self.inference_mode = True
 
 
@@ -212,8 +259,10 @@ class QuantizationControl:
 
     def clamp(self, slack=0):
         """
-        Clamp the values of the weights of all registered nodes to be within the clamping range
-        set in the constructor.
+        Clamp the values of the weights of all registered nodes to be within the clamping range set in the constructor.
+
+        This function iterates through all registered quantization-aware layers and instructs them to clamp their
+        weights.
         """
         clamp_range = self.clamp_values[0] - slack, self.clamp_values[1] + slack
         for node in self._registry.values():
@@ -221,6 +270,7 @@ class QuantizationControl:
 
 
     def collect_grad_norms(self):
+        # TODO (mw) docs
         norms = {}
         for name, node in self._registry.items():
             if node.weight.grad is not None:
@@ -230,11 +280,12 @@ class QuantizationControl:
 
     def quantize(self):
         """
-        Run hard-quantization on the weights of all registered nodes to fully conform to the
-        quantization range supplied in the controller.
+        Run hard-quantization on the weights of all registered nodes to fully conform to the quantization range supplied in the controller.
 
-        Use this as a final step after training when no further training is planned. Do not use this
-        for checkpointing.
+        This function iterates through all registered quantization-aware layers and instructs them to hard-quantize their weights.
+        You might want to run clamp() before running this function.
+
+        Use this as a final when no further training is planned. Do not use this for checkpointing.
         """
         for node in self._registry.values():
             w = torch.round(SoftStep.map(node.weight.data, self))
@@ -242,6 +293,12 @@ class QuantizationControl:
 
 
     def quantization_loss(self, penalty=None):
+        """
+        Compute loss function that penalizes imperfect quantization.
+
+        Use this method to compute a loss function (weighted by the supplied penalty) which penalizes weight data
+        not being integer values.
+        """
         total_loss = None
         p = penalty if penalty is not None else self.qpenalty
         for node in self._registry.values():
@@ -253,42 +310,58 @@ class QuantizationControl:
 
 
 class SoftStep(Function):
+    """
+    Main facility for quantization aware learning, transfer function that can be used inside PyTorch's autograd
+
+    This function represents a staircase function which is fully differentiable and is able to interpolate from
+    a standard linear mapping (1:1) to something very close to an actual staircase. When applied to the
+    weights, this "traps" the weights on the staircase levels, effectively quantization them.
+
+    The underlying function here is a piecewise polynomial, which usually computes faster than functions using
+    tanh or exp functions, as those primitives are executed on the SFUs on GPUs which are not as plenty as
+    standard ALUs (ranges from 1:4 to 1:8 on Turing and Ampere, tendency shifting more towards ALUs).
+    """
 
     @staticmethod
     @torch.no_grad()
     def map(weight: torch.Tensor, ctrl:QuantizationControl) -> torch.Tensor:
+        """
+        Map an unquantized tensor to a soft-quantized one, used for logging / debugging and not part of the evalution chain
+        """
         assert ctrl, "Control instance is required"
         fw = torch.floor(weight.data)
         arg = ctrl.digamma * weight.data - ctrl.digamma * fw - ctrl.digamma / 2.0
         val = SoftStep.sigmoid(arg) / (2.0 * SoftStep.scalar_sigmoid(ctrl.digamma / 2)) + 0.5 + fw
         return val
 
+
     @staticmethod
     @torch.no_grad()
     def dmap(weight: torch.Tensor, ctrl:QuantizationControl) -> torch.Tensor:
+        """
+        Map an unquantized tensor to the derivative of a soft-quantized one, used for logging / debugging and not part of the evaluation chain
+        """
         assert ctrl, "Control instance is required"
         digamma = ctrl.digamma
         arg = weight.data * digamma - digamma * torch.floor(weight.data) - digamma / 2
         return digamma * SoftStep.dsigmoid(arg) / (2.0 * SoftStep.scalar_sigmoid(digamma / 2))
 
-    @staticmethod
-    @torch.no_grad()
-    def dmapd(weight: torch.Tensor, ctrl: QuantizationControl) -> torch.Tensor:
-        assert ctrl, "Control instance is required"
-        digamma = ctrl.digamma
-        arg = weight.data * digamma - digamma * torch.floor(weight.data) - digamma / 2
-        ds = SoftStep.scalar_sigmoid(digamma/2)
-        dds = SoftStep.scalar_dsigmoid(digamma/2)
-        return (ds * SoftStep.dsigmoid(arg) * (weight.data - torch.floor(weight.data) - 0.5) - 0.5 * SoftStep.sigmoid(arg) * dds) / (2 * ds * ds)
 
     @staticmethod
     def sigmoid(input: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the underlying sigmoid function for the soft-quantization
+        """
         x = torch.clamp(input, -3.0, 3.0)
         x2 = x * x
         return x * (x2 + 27.0) / (27.0 + x2 * 9.0)
 
+
     @staticmethod
     def dsigmoid(input: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the 1st derivative underlying sigmoid function for the soft-quantization
+        """
         x = torch.clamp(input, -3.0, 3.0)
         x2 = x * x
         return ((x2-9)*(x2-9)) / (9 * (3+x2)*(3+x2))
@@ -296,19 +369,30 @@ class SoftStep(Function):
 
     @staticmethod
     def d2sigmoid(input: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the 2nd derivative underlying sigmoid function for the soft-quantization
+        """
         x = torch.clamp(input, -3.0, 3.0)
         x2 = x * x
         a = (x2+3)
         return 16*x*(x2-9) / (3*a*a*a)
 
+
     @staticmethod
     def scalar_sigmoid(input: float) -> float:
+        """
+        Evaluate the underlying sigmoid function for a single scalar (to compute constant factors)
+        """
         x = min(3.0, max(-3.0, input))
         x2 = x * x
         return x * (x2 + 27.0) / (27.0 + x2 * 9.0)
 
+
     @staticmethod
     def scalar_dsigmoid(input: float) -> float:
+        """
+        Evaluate the 1st derivative underlying sigmoid function for a single scalar (to compute constant factors)
+        """
         x = min(3.0, max(-3.0, input))
         x2 = x * x
         return ((x2-9)*(x2-9)) / (9 * (3+x2)*(3+x2))
@@ -316,6 +400,11 @@ class SoftStep(Function):
 
     @staticmethod
     def forward(ctx: FunctionCtx, weight: nn.Parameter, scale: float, ctrl: QuantizationControl):
+        """
+        Apply the soft quantization function to an incoming tensor within PyTorch's autograd framework
+
+        If the CUDA helpers are compiled, it will use an accelerated CUDA kernel (gain is not a lot though)
+        """
         ctx.ctrl = ctrl
         ctx.scale = scale               # NOTE (mw) scale is not used for the forward computation here, but stored for (optional) gradient scaling later
         ctx.save_for_backward(weight)
@@ -326,8 +415,14 @@ class SoftStep(Function):
             arg = ctrl.digamma * (weight - fw) - ctrl.digamma / 2.0
             return SoftStep.sigmoid(arg) / (2.0 * SoftStep.scalar_sigmoid(ctrl.digamma / 2.0)) + 0.5 + fw
 
+
     @staticmethod
     def backward(ctx: FunctionCtx, grad_output: torch.Tensor):
+        """
+        Apply chain-rule for backpropagation of gradients within PyTorch's autograd framework
+
+        If the CUDA helpers are compiled, it will use an accelerated CUDA kernel (gain is not a lot though)
+        """
         digamma = ctx.ctrl.digamma
         weight = ctx.saved_tensors[0]
         if weight.device.type == "cuda" and CUDA_EXT_AVAILABLE:
@@ -341,9 +436,27 @@ class SoftStep(Function):
 
 
 class SoftStepDerivative(Function):
+    """
+    Derivative of soft-quantization function  for quantization aware learning, can be used inside PyTorch's autograd
+
+    This function represents the 1st derivative of a staircase function which is fully differentiable and is able
+    to interpolate from a standard linear mapping (1:1) to something very close to an actual staircase. When applied to
+    the weights, this "traps" the weights on the staircase levels, effectively quantization them.
+
+    The underlying function here is a piecewise polynomial, which usually computes faster than functions using
+    tanh or exp functions, as those primitives are executed on the SFUs on GPUs which are not as plenty as
+    standard ALUs (ranges from 1:4 to 1:8 on Turing and Ampere, tendency shifting more towards ALUs).
+
+    Currently, this derivative is used for penalizing weights that are not properly quantized.
+    """
 
     @staticmethod
     def forward(ctx: FunctionCtx, weight: nn.Parameter, digamma, strength):
+        """
+        Apply the soft quantization function to an incoming tensor within PyTorch's autograd framework
+
+        If the CUDA helpers are compiled, it will use an accelerated CUDA kernel (gain is not a lot though)
+        """
         ctx.save_for_backward(weight)
         ctx.digamma = digamma
         ctx.strength = strength
@@ -358,6 +471,11 @@ class SoftStepDerivative(Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, grad_output: torch.Tensor):
+        """
+        Apply chain-rule for backpropagation of gradients within PyTorch's autograd framework
+
+        If the CUDA helpers are compiled, it will use an accelerated CUDA kernel (gain is not a lot though)
+        """
         digamma = ctx.digamma
         strength = ctx.strength
         weight = ctx.saved_tensors[0]
@@ -373,6 +491,11 @@ class SoftStepDerivative(Function):
 
 
 class TMQLayer:
+    """
+    Base class for all quantization-aware layers in this project.
+
+    Defines a basic interface and has some bookkeeping functionality.
+    """
     def __init__(self, ctrl=None, quant_mode=QuantMode.NONE, tensor_type=TensorType.FLOAT_32BIT, device=None):
         self._ctrl = ctrl
         self.quantization = quant_mode
@@ -382,29 +505,50 @@ class TMQLayer:
         self.original_shape = None
         self.post_scale_imm = 1.0
         self.post_scale = None
+        self.layer_name = None
         self._scale_dirty = True
 
     def compact_inference_mode(self):
+        """
+        Switch layer into compact inference mode
+        """
         self.training = False
         self.compact = True
 
+
     def quantization_loss(self, strength, sharpness):
+        """
+        Compute quantization loss function, to be implemented in derived classes
+        """
         raise Exception("Implement in derived classes")
 
 
     def quantize(self):
+        """
+        Run a hard quantization on the weights (not biases) of the layer, to be implemented in derived classes
+        """
         raise Exception("Implement in derived classes")
+
 
     @torch.no_grad()
     def clamp(self, limits=(-1., 1.)):
+        """
+        Clamp the weights (not biases) to the provided limits, to be implemented in derived classes
+        """
         raise Exception("Implement in derived classes")
+
 
     def _update_scale(self):
         if self._scale_dirty and self.post_scale is not None:
             self.post_scale_imm = self.post_scale.item()
             self._scale_dirty = False
 
+
     def _variance_estimate(self) -> float:
+        """
+        Estimate variance of output data when routed through linear combinations of weights under different
+        quantization levels. The assumption is that the input data is of unit variance without any bias.
+        """
         if self.quantization == QuantMode.TERNARY:          # {-1, 0, 1}
             return 2.0/3.0
         elif self.quantization == QuantMode.TWO_BIT:        # {-2,-1,0,1}
@@ -424,6 +568,11 @@ class TMQLayer:
 
 
 class Linear(nn.Module, TMQLayer):
+    """
+    Drop-in replacement for a standard Linear layer that is quantization aware.
+
+
+    """
     def __init__(self, in_features: int, out_features: int, bias:bool=True, device=None,
                  ctrl: QuantizationControl=None, quant_mode=QuantMode.NONE, post_scale=False):
         super(Linear, self).__init__()
@@ -440,21 +589,56 @@ class Linear(nn.Module, TMQLayer):
 
     def __repr__(self):
         if len(self.original_shape) == 2:
-            return "Linear(%d,%d) [tmq]" % self.original_shape
+            return "Linear(%d,%d) [tmq]" % self.original_shape + " <%s>" % self.layer_name
         else:
-            return "Linear(???) [tmq]"
-
+            return "Linear(???) [tmq] <%s>" % self.layer_name
 
     def quantize(self):
+        """
+        Quantize weight data (FP32) to the nearest integers
+        """
         self.weight.data = torch.round(self.weight.data).float()    # NOTE (mw) float for now
 
     def disable_bias(self):
+        """
+        Explicitly disable the affine component of the transform in this layer (no bias)
+        """
         self.bias = None
 
     def implicit_bn(self):
+        """
+        Add an internal BatchNorm layer to this layer in order to rescale results
+
+        A side effect of having a strict ternary set of weights is that the results of this layer are scaled
+        to rather large values. In order to maintain well-behaved intermediary distributions in the tensors,
+        a batch-norm layer is crucial to keep the data within an unbiased unit variance.
+
+        Note that this will alter the model structure and this function must also be called prior to
+        populating this model with checkpoint / serialized data.
+        """
         self.bn = nn.BatchNorm1d(self._out_features)
 
     def forward(self, x):
+        # mwmw
+        y = self.forward_wrap(x)
+        cpux = x.detach().cpu().numpy()
+        cpu = y.detach().cpu().numpy()
+        if self.compact:
+            cpux.tofile("/tmp/ter_%s_input.bin" % self.layer_name.lstrip("."))
+            cpu.tofile("/tmp/ter_%s.bin" % self.layer_name.lstrip("."))
+        else:
+            cpux.tofile("/tmp/ref_%s_input.bin" % self.layer_name.lstrip("."))
+            cpu.tofile("/tmp/ref_%s.bin" % self.layer_name.lstrip("."))
+        return y
+
+    def forward_wrap(self, x):
+        """
+        Apply the layer on input data
+
+        Same as the original forward() function in PyTorch, differentiates between "training" and "inference" mode,
+        when actual compact/ternary data is loaded into the model. Will then use the compact_forward() function
+        instead.
+        """
         if self.compact:
             return self.compact_forward(x)
         else:
@@ -472,11 +656,16 @@ class Linear(nn.Module, TMQLayer):
         return self.bn(final) if self.bn is not None else final
 
 
-
     @torch.no_grad()
     def compact_forward(self, x):
+        """
+        Specialized forward() that works in inference only with compact data loaded into the layer.
+
+        When this layer is populated with compact data representation (2-bits for ternary)
+        """
         assert self.training == False, "Compact inference is not supported in training mode"
         assert self.weight.data.dtype == torch.int32, "Compact inference requires 32-bit integer words"
+        assert CUDA_EXT_AVAILABLE, "Compact inference mode requires CUDA extension to be available"
 
         self._update_scale()
         rows = 1
@@ -492,13 +681,15 @@ class Linear(nn.Module, TMQLayer):
         if self.post_scale != 1.0:
             out *= self.post_scale
         if self.bias is not None:
-            return out + self.bias
-        else:
-            return out
+            out += self.bias
+        return self.bn(out) if self.bn is not None else out
 
 
     @torch.no_grad()
     def clamp(self, limits=(-1., 1.)):
+        """
+        Clamp the weights (not biases) to the provided limits, to be implemented in derived classes
+        """
         self.weight.data = torch.clamp(self.weight.data, limits[0], limits[1])
 
     def quantization_loss(self, strength, sharpness):
@@ -507,16 +698,19 @@ class Linear(nn.Module, TMQLayer):
 
     @classmethod
     def from_linear(cls, source: nn.Linear, name: str, ctrl: QuantizationControl):
+        # TODO (mw) docs
         assert ctrl, "Control instance is required"
         obj = cls(source.in_features, source.out_features, source.bias is not None,
                   ctrl=ctrl, device=source.weight.device, quant_mode=ctrl.quantization,
                   post_scale=ctrl.post_scale)
+        obj.layer_name = name
         ctrl.register_node(name, obj)
         return obj
 
 
     @torch.no_grad()
     def _init_weights(self, bias, device):
+        # TODO (mw) docs
         if bias:
             b = torch.zeros(self._out_features)
             self.bias = nn.Parameter(b.to(device), requires_grad=True)
@@ -552,6 +746,8 @@ class Linear(nn.Module, TMQLayer):
             self.tensor_type = TensorType(local_metadata["tmq.tensor_type"])
             self.original_shape = local_metadata["tmq.shape"]
             if self.tensor_type == TensorType.COMPRESSED_TERNARY_32BIT:
+                if not NATIVE_EXT_AVAILABLE:
+                    raise Exception("Native extension required to use entropy-coded weight data")
                 self.weight = nn.Parameter(decompress_ternary(state_dict[prefix + "weight"], self.original_shape), requires_grad=False)
                 self.tensor_type = TensorType.COMPACT_TERNARY_32BIT
                 self.compact = True
@@ -563,7 +759,7 @@ class Linear(nn.Module, TMQLayer):
             self.quantization = QuantMode(local_metadata["tmq.quant"])
             self.training = False if self.compact else self.training
         else:
-            self.compact = False
+            self.compact = False            # This is just a standard floating-point data load
 
 
 
@@ -593,15 +789,18 @@ class Conv2d(nn.Module, TMQLayer):
 
 
     def __repr__(self):
-        return "Conv2d(%d,%d,%d,%d) [tmq]" % self.original_shape
+        return "Conv2d(%d,%d,%d,%d) [tmq]" % self.original_shape + " <%s>" % self.layer_name
+
 
     def to(self, *args, **kwargs):
+        # TODO (mw) docs
         me = super().to(*args, **kwargs)
         me.post_scale_imm = me.post_scale.item()
         return me
 
 
     def forward(self, x):
+        # TODO (mw) docs
         if self.compact:
             return self.compact_forward(x)
         else:
@@ -619,8 +818,10 @@ class Conv2d(nn.Module, TMQLayer):
 
     @torch.no_grad()
     def compact_forward(self, x):
+        # TODO (mw) docs
         assert not self.training, "Compact inference is not supported in training mode"
         assert self.weight.data.dtype == torch.int32, "Compact inference requires 32-bit integer words"
+        assert CUDA_EXT_AVAILABLE, "Compact inference mode requires CUDA extension to be available"
 
         self._update_scale()
         bs = 1
@@ -669,19 +870,27 @@ class Conv2d(nn.Module, TMQLayer):
 
     @torch.no_grad()
     def clamp(self, limits=(-1., 1.)):
+        """
+        Clamp the weights (not biases) to the provided limits, to be implemented in derived classes
+        """
         self.weight.data = torch.clamp(self.weight.data, limits[0], limits[1])
 
 
     def quantize(self):
+        """
+        Run a hard quantization on the weights (not biases) of the layer, to be implemented in derived classes
+        """
         self.weight.data = torch.round(self.weight.data).float()        # NOTE (mw) float for now
 
 
     def quantization_loss(self, strength, sharpness):
+        # TODO (mw) docs
         return torch.mean(SoftStepDerivative.apply(self.weight, sharpness, strength))
 
 
     @classmethod
     def from_conv2d(cls, source: nn.Conv2d, name: str, ctrl: QuantizationControl):
+        # TODO (mw) docs
         assert ctrl, "Controller required"
         obj = cls(source.in_channels, source.out_channels, source.kernel_size,
                   stride=source.stride,
@@ -693,6 +902,7 @@ class Conv2d(nn.Module, TMQLayer):
                   ctrl=ctrl,
                   quant_mode=ctrl.quantization,
                   post_scale=ctrl.post_scale)
+        obj.layer_name = name
         ctrl.register_node(name, obj)
         return obj
 
@@ -744,6 +954,8 @@ class Conv2d(nn.Module, TMQLayer):
             self.tensor_type = TensorType(local_metadata["tmq.tensor_type"])
             self.original_shape = local_metadata["tmq.shape"]
             if self.tensor_type == TensorType.COMPRESSED_TERNARY_32BIT:
+                if not NATIVE_EXT_AVAILABLE:
+                    raise Exception("Native extension required to use entropy-coded weight data")
                 self.weight = nn.Parameter(decompress_ternary(state_dict[prefix + "weight"], self.original_shape), requires_grad=False)
                 self.tensor_type = TensorType.COMPACT_TERNARY_32BIT
                 self.compact = True
@@ -769,10 +981,11 @@ class ConvTranspose2d(Conv2d):
         self.output_padding = output_padding
 
     def __repr__(self):
-        return "ConvTranspose2d(%d,%d,%d,%d) [tmq]" % self.original_shape
+        return "ConvTranspose2d(%d,%d,%d,%d) [tmq] " % self.original_shape + " <%s>" % self.layer_name
 
 
     def forward(self, x):
+        # TODO (mw) docs
         if self.compact:
             return self.compact_forward(x)
         else:
@@ -792,6 +1005,7 @@ class ConvTranspose2d(Conv2d):
     def compact_forward(self, x):
         assert self.training == False, "Compact inference is not supported in training mode"
         assert self.weight.data.dtype == torch.int32, "Compact inference requires 32-bit integer words"
+        assert CUDA_EXT_AVAILABLE, "Compact inference mode requires CUDA extension to be available"
 
         self._update_scale()
         pady, padx = self.padding if isinstance(self.padding, tuple) else (self.padding, self.padding)
@@ -827,6 +1041,7 @@ class ConvTranspose2d(Conv2d):
 
     @classmethod
     def from_transconv2d(cls, source: nn.ConvTranspose2d, name: str, ctrl: QuantizationControl):
+        # TODO (mw) docs
         assert ctrl, "Controller required"
         obj = cls(source.in_channels, source.out_channels, source.kernel_size,
                   stride=source.stride,
@@ -839,12 +1054,14 @@ class ConvTranspose2d(Conv2d):
                   ctrl=ctrl,
                   quant_mode=ctrl.quantization,
                   post_scale=ctrl.post_scale)
+        obj.layer_name = name
         ctrl.register_node(name, obj)
         return obj
 
 
     @torch.no_grad()
     def _init_weights(self, bias, device):
+        # TODO (mw) docs
         if isinstance(self.kernel, tuple):
             self._fan_in = self.kernel[0] * self.kernel[1] * self.in_channels
             self._fan_out = self.kernel[0] * self.kernel[1] * self.out_channels
@@ -879,6 +1096,7 @@ def quantize_weights(module: nn.Module):
 
 
 def _recursive_quantize_weights(module: nn.Module):
+    # TODO (mw) docs
     for name, sub in module.named_children():
         if isinstance(sub, TMQLayer):
             if sub.weight.data.dtype == torch.float16:
@@ -892,7 +1110,7 @@ def _recursive_quantize_weights(module: nn.Module):
 
 def quantize_model(module: nn.Module, ctrl: QuantizationControl, prefix="", exclude=[]):
     """
-    Perform an in-place swap of model/module components in favour of quantizing layers
+    Perform an in-place swap of model/module components in favour of quantization-aware layers
 
     This function traverses the supplied module and checks for layer types which can be swapped for a layer
     that performs in-training quantization. Those layers are swapped in-place, altering the supplied
@@ -999,6 +1217,8 @@ def _recursive_compress_ternary(module: nn.Module, strong):
                     sub.tensor_type = TensorType.COMPACT_TERNARY_32BIT
                     sub.weight = nn.Parameter(compressed, requires_grad=False)
                 elif strong and sub.tensor_type != TensorType.COMPRESSED_TERNARY_32BIT:
+                    if not NATIVE_EXT_AVAILABLE:
+                        raise Exception("Cannot store entropy-coded weight data without native helper available")
                     compressed = compress_ternary(sub.weight.data, sub.original_shape, True if sub.tensor_type == TensorType.COMPACT_TERNARY_32BIT else False)
                     sub.tensor_type = TensorType.COMPRESSED_TERNARY_32BIT
                     sub.weight = nn.Parameter(compressed, requires_grad=False)
@@ -1007,19 +1227,20 @@ def _recursive_compress_ternary(module: nn.Module, strong):
 
 
 def _recursive_state_endowment(module: nn.Module, state_dict, strong, prefix=""):
+    # TODO (mw) docs
     for name, sub in module.named_children():
         fullname = prefix + "." + name if prefix != "" else name
         if isinstance(sub, TMQLayer):
-            if sub.tensor_type == TensorType.COMPRESSED_TERNARY_32BIT:
-                # For cases where inference is to be done right after getting the compressed state dict, we
-                # decompress to compact representation here
-                sub.weight = nn.Parameter(decompress_ternary(sub.weight.data, sub.original_shape), requires_grad=False)
-                sub.tensor_type = TensorType.COMPACT_TERNARY_32BIT
             sub.compact_inference_mode()
             meta = state_dict._metadata[fullname]
             meta["tmq.tensor_type"] = sub.tensor_type.value
             meta["tmq.shape"] = sub.original_shape
             meta["tmq.quant"] = sub.quantization.value
+            if sub.tensor_type == TensorType.COMPRESSED_TERNARY_32BIT:
+                # For cases where inference is to be done right after getting the compressed state dict, we
+                # decompress to compact representation here
+                sub.weight = nn.Parameter(decompress_ternary(sub.weight.data, sub.original_shape), requires_grad=False)
+                sub.tensor_type = TensorType.COMPACT_TERNARY_32BIT
         else:
             _recursive_state_endowment(sub, state_dict, strong, fullname)
 
@@ -1057,6 +1278,7 @@ def _recursive_cmp_model_adjustment(module: nn.Module, state_dict, prefix=""):
         fullname = prefix + "." + name if prefix != "" else name
         meta = state_dict._metadata
         if isinstance(sub, TMQLayer):
+            sub.layer_name = fullname
             if fullname in meta:
                 weight_name = fullname + ".weight"
                 tensor_type = TensorType(meta[fullname]["tmq.tensor_type"])
@@ -1080,6 +1302,7 @@ def expand_compact_layers(module: nn.Module, for_training=False):
 
 
 def _recursive_expansion(module: nn.Module, for_training):
+    # TODO (mw) docs
     for _, sub in module.named_children():
         if isinstance(sub, TMQLayer) and hasattr(sub, "tensor_type") and hasattr(sub,"original_shape"):
             entropy = True if sub.tensor_type == TensorType.COMPRESSED_TERNARY_32BIT else False

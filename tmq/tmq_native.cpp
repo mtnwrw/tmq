@@ -41,12 +41,11 @@ static uint64_t ntohll(uint64_t value) {
 /**
  * @brief Run entropy coding (simple range coding) on 2D bit-stuffed matrix
  *
- * @param input
- * @param rows
- * @param columns
+ * @param input Input matrix to compress, stored in compact 2-bit per entry format
+ * @param rows Number of rows in the matrix
+ * @param columns Number of columns in the matrix
  *
- * @return
- *
+ * @return Combination of output data-stream and size of the data-stream
  */
 static std::pair<uint8_t *, uint32_t> entropyEncodeTernary(const uint32_t * input, int64_t rows, int64_t columns) {
     uint8_t symtable[4] = {1, 2, 0, 3};   // 0, -1, 1, _
@@ -133,6 +132,7 @@ static uint64_t entropyDecodeTernary(const uint8_t *input, uint32_t *output, int
                 uint8_t bits = symtable[sym];
                 shiftreg = (shiftreg << 2) | bits;
             }
+            if (lim != 16) shiftreg <<= (2 * (16-lim));
             *output++ = shiftreg;
         }
     }

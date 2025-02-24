@@ -23,22 +23,25 @@ from torch import nn
 from torch.autograd.function import Function, FunctionCtx
 import fnmatch
 from enum import Enum
-import math
 
 # Import CUDA helpers if compiled
 try:
-    from tmq_cuda import fwd_softstep, bwd_softstep, ternary_mmm_cuda, ternary_mvm_cuda, \
-                         ternary_dwconv_cuda,  ternary_dwconvtrans_cuda, \
-                         fwd_softstep_derivative, bwd_softstep_derivative
+    from .tmq_cuda import fwd_softstep, bwd_softstep, ternary_mmm_cuda, ternary_mvm_cuda, \
+                          ternary_dwconv_cuda,  ternary_dwconvtrans_cuda, \
+                          fwd_softstep_derivative, bwd_softstep_derivative
     CUDA_EXT_AVAILABLE = True
-except ImportError:
+except ImportError as err:
+    print("WARNING: Cannot load CUDA extension, please double-check your installation")
+    print(f"Error from import: {err}")
     CUDA_EXT_AVAILABLE = False
 
 # Import native code helpers (for compression) if compiled
 try:
-    from tmq_native import compactify_ternary, compress_ternary, decompress_ternary, expand_ternary
+    from .tmq_native import compactify_ternary, compress_ternary, decompress_ternary, expand_ternary
     NATIVE_EXT_AVAILABLE = True
-except ImportError:
+except ImportError as err:
+    print("WARNING: Cannot load native extension, please double-check your installation")
+    print(f"Error from import: {err}")
     # NOTE (mw) when native helpers are not available, we cannot compress or decompress the data
     NATIVE_EXT_AVAILABLE = False
 
@@ -1298,6 +1301,8 @@ def expand_compact_layers(module: nn.Module, for_training=False):
     :param for_training: If set to True, makes sure that the "required_grad" flag is set to True on the weights,
                          otherwise it is set to False
     """
+    if not NATIVE_EXT_AVAILABLE:
+        raise Exception("Must have TMQ native extension compiled and available to decompress data")
     _recursive_expansion(module, for_training)
 
 

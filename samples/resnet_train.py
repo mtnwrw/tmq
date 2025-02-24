@@ -347,7 +347,7 @@ if __name__ == "__main__":
     # Quantize model, this part is TMQ-specific and has to be
     # added to existing non-quantized code-bases
     # -----------------------------------------------------------------------------
-    schedule = QuantizationScheduleBuilder. default_schedule(args.max_epochs)
+    schedule = QuantizationScheduleBuilder.default_schedule(args.max_epochs)
     ctrl = QuantizationControl(schedule, digamma_range=(0.1, args.digamma), qpenalty_range=(args.qpenbase, args.qpen), post_scale=args.scale, device=args.device) if not args.float else None
 
     if ctrl is not None:

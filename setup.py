@@ -3,6 +3,8 @@
 # Copyright (c) 2025 TMQ Authors
 # SPDX-License-Identifier: MPL-2.0
 
+# Use for in-place builds and experimenting around
+
 __author__ = 'Martin Wawro'
 
 from setuptools import setup
@@ -19,4 +21,6 @@ setup(
             "tmq/tmq_native.cpp"
         ]),
     ],
-    cmdclass={ "build_ext" : BuildExtension})
+    install_requires = [ "cmake", "ninja", "torch>=2.1", "pybind11>=2" ],
+    cmdclass={ "build_ext" : BuildExtension}
+)

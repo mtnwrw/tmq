@@ -1,4 +1,4 @@
-# TMQ: Quantization-Aware Parsimonous Neural Networks
+# TMQ: Quantization-Aware Parsimonious Neural Networks
 
 ## Overview
 
@@ -16,7 +16,7 @@ You can give it a quick tryout on a [Google Colab](https://colab.research.google
 
 ## Does it work ?
 
-Here are some quick results (to be expanded) one some network/dataset combination:
+Here are some quick results (to be expanded) on some network/dataset combination:
 
 | Network    | Dataset     | Top-1 acc | Top-3 acc | Weights  |                                              Size on disk |
 |------------|-------------|-----------|-----------|----------|----------------------------------------------------------:|

@@ -428,7 +428,8 @@ torch::Tensor compactifyTernary(torch::Tensor input) {
 /**
  * @brief Compress ternary input weight tensor (either linear or convolution) using entropy coding
  *
- * @param input
+ * @param input Input (integer) tensor data to run entropy-coding on
+
  * @param fromCompact
  *
  * @return

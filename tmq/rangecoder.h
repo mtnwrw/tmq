@@ -48,8 +48,8 @@ class RangeEncoder {
     /**
      * @brief Constructor
      *
-     * @param pmf Probability mass function for the symbols, it is actually more like a histogram since there are no
-                  normalization requirements (done internally)
+     * @param pmf Probability mass function for the symbols, where data is normalized to 16-bit unsigned integer
+     *            values, i.e. probability of 1 corresponds to 65535.
      *
      * @warning The supplied \p pmf \e must have a probability value for each symbol, failure to provide a value
      *            will result in crashes and non-deterministic behaviour.
@@ -60,6 +60,11 @@ class RangeEncoder {
         histoTotal_ = cmf_.back() + pmf_.back();
     }
 
+    /**
+     * @brief Encode symbol to output bitstream
+     *
+     * @param symbol Symbol to encode
+     */
     void encode(T symbol) {
         assert(pmf_[symbol] > 0);
         assert(histoTotal_ <= 0x10000);
@@ -78,6 +83,11 @@ class RangeEncoder {
         }
     }
 
+    /**
+     * @brief Flush output bitstream
+     *
+     * @note Must be called when done with symbol encoding to flush out the remaining bits in the normalization buffer
+     */
     void flush() {
         for (int i=0; i<4; i++) {
             stream_.appendByte(state_.low >> 24);
@@ -104,6 +114,7 @@ class RangeEncoder {
 /**
  * @brief Minimal range decoder implementation
  *
+ * This class implements a simple range decoder which runs bytewise renormalization on the input streams.
  *
  * @see ReadStream, RangeEncoder
  */
@@ -115,7 +126,18 @@ class RangeDecoder {
         uint32_t shiftReg = 0;
     };
  public:
-    explicit RangeDecoder(const std::vector<uint16_t> & pmf, const B & stream) : pmf_(pmf), stream_(stream) {
+    /**
+     * @brief Constructor
+     *
+     * @param pmf Probability mass function for the symbols, where data is normalized to 16-bit unsigned integer
+     *            values, i.e. probability of 1 corresponds to 65535. Data must have been decoded from stream already
+     *            or hardcoded in the source.
+     *
+     * @param stream Input data stream to read compressed symbols from
+     *
+     * @see ReadStream
+     */
+    RangeDecoder(const std::vector<uint16_t> & pmf, const B & stream) : pmf_(pmf), stream_(stream) {
         cmf_.resize(pmf.size());
         for (size_t i=1; i < pmf.size(); i++) cmf_[i] = cmf_[i-1] + pmf[i-1];
         histoTotal_ = cmf_.back() + pmf_.back();
@@ -125,6 +147,13 @@ class RangeDecoder {
         state_.range = 0xFFFFFFFF;
     }
 
+    /**
+     * @brief Decode single symbol from input bitstream
+     *
+     * @return Symbol decoded from stream
+     *
+     * @see findSymbol()
+     */
     T decode() {
         state_.range /= histoTotal_;
         uint32_t freq = (state_.shiftReg - state_.low) / (state_.range);
@@ -142,7 +171,11 @@ class RangeDecoder {
     }
 
  private:
+    /**
+     * @brief Find corresponding symbol in cumulative probability function by binary search
+     */
     T findSymbol(uint32_t freq, int low, int high) const {
+        // TODO (mw) use a non-recursive version instead
         int mid = (low + high)/2;
         if (cmf_[mid] > freq) {
             return findSymbol(freq, low, mid);

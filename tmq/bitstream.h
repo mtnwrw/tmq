@@ -21,7 +21,13 @@
 //------------------------------------- Public Declarations ----------------------------------------
 
 
-// TODO (mw) docs
+/**
+ * @brief Bitstream class for output
+ *
+ * This class provides functionality to create and maintain a stream of bits for serialization into
+ * an I/O device. It performs all the nitty-gritty bit-stuffing and provides a neat and simple
+ * interface.
+ */
 class WriteStream {
  public:
     WriteStream() {
@@ -98,7 +104,12 @@ class WriteStream {
 
 
 
-// TODO (mw) docs
+/**
+ * @brief Bitstream class for input
+ *
+ * This class provides functionality to create and maintain an input bitstream from an I/O device.
+ * It performs all the nitty-gritty bit-stuffing and provides a neat and simple interface.
+ */
 template<class BTYPE>
 class ReadStream {
     using BufferType = typename std::conditional<

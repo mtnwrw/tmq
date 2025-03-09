@@ -360,12 +360,8 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
     # Create optimizer and optional learning rate scheduler
     # -----------------------------------------------------------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    if args.float:
-        # Use a learning rate scheduler for 32-bit FP reference computations
-        lrscheduler = ExponentialLR(optimizer, gamma=0.99)
-    else:
-        lrscheduler = None
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr) if args.float else torch.optim.Adam(model.parameters(), lr=args.lr)
+    lrscheduler = ExponentialLR(optimizer, gamma=0.985) if args.float else None
 
     start_epoch = 1
 

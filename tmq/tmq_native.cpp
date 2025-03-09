@@ -469,6 +469,7 @@ torch::Tensor compressTernary(torch::Tensor input, std::vector<int64_t> origShap
         }
     } else {
         TORCH_CHECK(shape.size() <= 2 || shape.size() == 4);
+        TORCH_CHECK(input.dtype() == torch::kFloat32);
         if (shape.size() <= 2) return compressTernaryMatrix(input, fromCompact);
         if (shape.size() == 4) return compressTernaryConvKernel(input, fromCompact);
         throw std::invalid_argument("Cannot handle the supplied shape");

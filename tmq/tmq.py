@@ -1222,8 +1222,7 @@ def _recursive_compress_ternary(module: nn.Module, strong):
                 elif strong and sub.tensor_type != TensorType.COMPRESSED_TERNARY_32BIT:
                     if not NATIVE_EXT_AVAILABLE:
                         raise Exception("Cannot store entropy-coded weight data without native helper available")
-                    compact = compactify_ternary(sub.weight.data) if sub.tensor_type != TensorType.COMPACT_TERNARY_32BIT else sub.weight.data
-                    compressed = compress_ternary(compact, sub.original_shape, True if sub.tensor_type == TensorType.COMPACT_TERNARY_32BIT else False)
+                    compressed = compress_ternary(sub.weight.data, sub.original_shape, True if sub.tensor_type == TensorType.COMPACT_TERNARY_32BIT else False)
                     sub.tensor_type = TensorType.COMPRESSED_TERNARY_32BIT
                     sub.weight = nn.Parameter(compressed, requires_grad=False)
         else:
